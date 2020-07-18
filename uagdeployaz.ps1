@@ -1,5 +1,5 @@
 #
-#  Copyright © 2018, 2019, 2020 VMware Inc. All rights reserved.
+#  Copyright - 2018, 2019, 2020 VMware Inc. All rights reserved.
 #
 #  Permission is hereby granted, free of charge, to any person obtaining a copy
 #  of the software in this file (the "Software"), to deal in the Software 
@@ -223,9 +223,9 @@ function DeleteExistingUAGResources {
     # Delete the NICs
     #
 
-    $out = Remove-AzureRmNetworkInterface -ResourceGroupName $resourceGroupName -Name $($uagName+"-eth0")  –Force
-    $out = Remove-AzureRmNetworkInterface -ResourceGroupName $resourceGroupName -Name $($uagName+"-eth1")  –Force
-    $out = Remove-AzureRmNetworkInterface -ResourceGroupName $resourceGroupName -Name $($uagName+"-eth2")  –Force
+    $out = Remove-AzureRmNetworkInterface -ResourceGroupName $resourceGroupName -Name $($uagName+"-eth0") -Force
+    $out = Remove-AzureRmNetworkInterface -ResourceGroupName $resourceGroupName -Name $($uagName+"-eth1") -Force
+    $out = Remove-AzureRmNetworkInterface -ResourceGroupName $resourceGroupName -Name $($uagName+"-eth2") -Force
 
 }
 
@@ -620,6 +620,184 @@ if (!$newvm) {
 }
 
 Write-Host ". OK"
+
+#
+# Create a pair of uags with managed disks and set them a same availability sets.
+# 
+
+function CreateNIC2 {
+    Param ($settings, $uagName, $nic)
+
+    $virtualNetworkName = $settings.Azure.virtualNetworkName
+    $subnetName = $settings.Azure.("subnetName"+$nic)
+    $resourceGroupName = $settings.Azure.resourceGroupName
+    $nicName = $uagName+"-eth"+$nic
+    $networkSecurityGroupName = $settings.Azure.("networkSecurityGroupName"+$nic)
+
+    $vnet = Get-AzureRmVirtualNetwork -Name $virtualNetworkName -ResourceGroupName $resourceGroupName -ErrorAction Ignore -WarningAction SilentlyContinue
+
+    if ($publicIPAddressName.length -gt 0) {
+        $pip=Get-AzureRmPublicIpAddress -Name $publicIPAddressName -ResourceGroupName $resourceGroupName -ErrorAction Ignore -WarningAction SilentlyContinue
+        $pipParam = @{
+            "PublicIpAddressId"=$pip.Id
+        }
+    } else {
+        $pipParam = @{}
+    }
+
+    if ($networkSecurityGroupName.length -gt 0) {
+        $nsg=Get-AzureRmNetworkSecurityGroup -Name $networkSecurityGroupName -ResourceGroupName $resourceGroupName -ErrorAction Ignore -WarningAction SilentlyContinue
+        $nsgParam = @{
+            "NetworkSecurityGroupId"=$nsg.Id
+        }
+    } else {
+        $nsgParam = @{}
+    }
+
+    $subnetId = $vnet.Subnets[0].Id
+
+    if ($subnetName.Length -gt 0) {
+        $sn = Get-AzureRmVirtualNetworkSubnetConfig -Name $subnetName -VirtualNetwork $vnet -ErrorAction Ignore -WarningAction SilentlyContinue
+        if ($sn) {
+            $subnetId = $sn.Id
+        }
+    }
+
+    $newnic = New-AzureRmNetworkInterface -Name $nicName -ResourceGroupName $resourceGroupName -Location $settings.Azure.location -Force -SubnetId $subnetId @pipParam @nsgParam -WarningAction SilentlyContinue
+
+    If([string]::IsNullOrEmpty($newnic)) {    
+        $msg = $error[0]
+        WriteErrorString "Error: Failed to create NIC$nic - $msg"
+        Exit
+    }
+
+    $newnic
+}
+
+write-host "Deployed a master UAG instance. Continue to create a apair of UAGs with Managed disks.."
+
+$uagName1 = $uagName + "01"
+$uagName2 = $uagName + "02"
+$DiskName1 = $uagName + "01"
+$DiskName2 = $uagName + "02"
+$AvailSetName = $settings.Azure.AvailSet
+$StorageAccountType = "Standard_LRS"
+
+$disk1 = New-AzureRmDisk -DiskName $DiskName1 -Disk (New-AzureRmDiskConfig -AccountType Standard_LRS -Location $location -CreateOption Import -SourceUri $osDiskUri) -ResourceGroupName $resourceGroupName
+
+Start-Sleep -s 10
+
+$disk2 = New-AzureRmDisk -DiskName $DiskName2 -Disk (New-AzureRmDiskConfig -AccountType Standard_LRS -Location $location -CreateOption Import -SourceUri $osDiskUri) -ResourceGroupName $resourceGroupName
+
+$availset = Get-AzureRmAvailabilitySet -Name $AvailSetName -ResourceGroupName $resourceGroupName
+$osDisk1 = get-azurermdisk -ResourceGroupName $resourceGroupName -DiskName $DiskName1
+$osDisk2 = get-azurermdisk -ResourceGroupName $resourceGroupName -DiskName $DiskName2
+
+$Vm1 = New-AzureRmVMConfig -Name $uagName1 -VMSize $vmSize -AvailabilitySetId $availSet.Id
+switch -Wildcard ($deploymentOption) {
+
+    'onenic*' {
+        ValidateNetworkSettings $settings "0"
+        $eth0 = CreateNIC2 $settings $uagName1 "0"
+        $vm1 = Add-AzureRmVMNetworkInterface -VM $vm1 -Id $eth0.Id -Primary
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode0=DHCPV4+DHCPV6"))
+    }
+    'twonic*' {
+        ValidateNetworkSettings $settings "0"
+        ValidateNetworkSettings $settings "1"
+        $eth0 = CreateNIC2 $settings $uagName1 "0"
+        $vm1 = Add-AzureRmVMNetworkInterface -VM $vm1 -Id $eth0.Id -Primary
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode0=DHCPV4+DHCPV6"))
+        $eth1 = CreateNIC2 $settings $uagName1 "1"
+        $vm1 = Add-AzureRmVMNetworkInterface -VM $vm1 -Id $eth1.Id
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode1=DHCPV4+DHCPV6"))
+    }
+    'threenic*' {
+        ValidateNetworkSettings $settings "0"
+        ValidateNetworkSettings $settings "1"
+        ValidateNetworkSettings $settings "2" 
+        $eth0 = CreateNIC2 $settings $uagName1 "0"
+        $vm1 = Add-AzureRmVMNetworkInterface -VM $vm1 -Id $eth0.Id -Primary
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode0=DHCPV4+DHCPV6"))
+        $eth1 = CreateNIC2 $settings $uagName1 "1"
+        $vm1 = Add-AzureRmVMNetworkInterface -VM $vm1 -Id $eth1.Id
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode1=DHCPV4+DHCPV6"))
+        $eth2 = CreateNIC2 $settings $uagName1 "2"
+        $vm1 = Add-AzureRmVMNetworkInterface -VM $vm1 -Id $eth2.Id
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode2=DHCPV4+DHCPV6"))
+    }
+    default {
+        WriteErrorString "Error: Invalid deploymentOption ($deploymentOption)."
+        [IO.File]::Delete($ovfFile)
+        Exit  
+    }
+}
+
+$Vm2 = New-AzureRmVMConfig -Name $uagName2 -VMSize $VmSize -AvailabilitySetId $availSet.Id
+switch -Wildcard ($deploymentOption) {
+
+    'onenic*' {
+        ValidateNetworkSettings $settings "0"
+        $eth0 = CreateNIC2 $settings $uagName2 "0"
+        $vm2 = Add-AzureRmVMNetworkInterface -VM $vm2 -Id $eth0.Id -Primary
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode0=DHCPV4+DHCPV6"))
+    }
+    'twonic*' {
+        ValidateNetworkSettings $settings "0"
+        ValidateNetworkSettings $settings "1"
+        $eth0 = CreateNIC2 $settings $uagName2 "0"
+        $vm2 = Add-AzureRmVMNetworkInterface -VM $vm2 -Id $eth0.Id -Primary
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode0=DHCPV4+DHCPV6"))
+        $eth1 = CreateNIC2 $settings $uagName2 "1"
+        $vm2 = Add-AzureRmVMNetworkInterface -VM $vm2 -Id $eth1.Id
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode1=DHCPV4+DHCPV6"))
+    }
+    'threenic*' {
+        ValidateNetworkSettings $settings "0"
+        ValidateNetworkSettings $settings "1"
+        ValidateNetworkSettings $settings "2" 
+        $eth0 = CreateNIC2 $settings $uagName2 "0"
+        $vm2 = Add-AzureRmVMNetworkInterface -VM $vm2 -Id $eth0.Id -Primary
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode0=DHCPV4+DHCPV6"))
+        $eth1 = CreateNIC2 $settings $uagName2 "1"
+        $vm2 = Add-AzureRmVMNetworkInterface -VM $vm2 -Id $eth1.Id
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode1=DHCPV4+DHCPV6"))
+        $eth2 = CreateNIC2 $settings $uagName2 "2"
+        $vm2 = Add-AzureRmVMNetworkInterface -VM $vm2 -Id $eth2.Id
+        [IO.File]::AppendAllLines($ovfFile, [string[]]("ipMode2=DHCPV4+DHCPV6"))
+    }
+    default {
+        WriteErrorString "Error: Invalid deploymentOption ($deploymentOption)."
+        [IO.File]::Delete($ovfFile)
+        Exit  
+    }
+}
+
+$vm1 = Set-AzureRmVMOSDisk -VM $vm1 -ManagedDiskId $osDisk1.Id -StorageAccountType $StorageAccountType -CreateOption Attach -Linux
+$vm2 = Set-AzureRmVMOSDisk -VM $vm2 -ManagedDiskId $osDisk2.Id -StorageAccountType $StorageAccountType -CreateOption Attach -Linux
+
+$newvm1 = New-AzureRmVM -ResourceGroupName $ResourceGroupName -Location $location -VM $Vm1
+$newvm2 = New-AzureRmVM -ResourceGroupName $ResourceGroupName -Location $location -VM $Vm2
+
+if (!$newvm1) {
+    Write-Host ". FAILED"
+    $msg = $error[0]
+    WriteErrorString "Error: Failed to create $uagName VM ($msg)."
+    [IO.File]::Delete($ovfFile)
+    Exit
+}
+
+if (!$newvm2) {
+    Write-Host ". FAILED"
+    $msg = $error[0]
+    WriteErrorString "Error: Failed to create $uagName VM ($msg)."
+    [IO.File]::Delete($ovfFile)
+    Exit
+}
+
+DeleteExistingUAGResources $settings $uagName
+
+write-host "deleted master $uagName"
 
 write-host "Deployed $uagName successfully to Azure resource group $resourceGroupName"
 
